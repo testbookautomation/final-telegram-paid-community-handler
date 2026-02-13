@@ -1,14 +1,19 @@
 {
   "name": "final-pass-paid-community-larger-requests-handler",
-  "version": "1.1.0",
+  "version": "1.2.0",
+  "description": "Telegram Paid Community Invite + Join Handler (Cloud Run + Cloud Tasks)",
   "main": "server.js",
-  "scripts": { 
-    "start": "node server.js" 
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
   },
   "dependencies": {
     "@google-cloud/firestore": "^7.11.0",
     "@google-cloud/tasks": "^4.2.0",
     "express": "^4.19.2",
     "node-fetch": "^2.6.7"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
