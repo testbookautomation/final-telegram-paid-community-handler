@@ -3,6 +3,7 @@
 const express = require("express");
 const crypto = require("crypto");
 const { Firestore, FieldValue } = require("@google-cloud/firestore");
+const { CloudTasksClient } = require("@google-cloud/tasks");
 
 const fetch = (...args) =>
   import("node-fetch").then(({ default: fetch }) => fetch(...args));
@@ -17,12 +18,21 @@ const {
   WEBENGAGE_LICENSE_CODE,
   WEBENGAGE_API_KEY,
   FIRE_JOIN_EVENT,
+  GCP_PROJECT,
+  GCP_LOCATION = "asia-south1",
+  TASKS_QUEUE = "telegram-invite-queue",
+  BASE_URL,
   PORT = 8080,
 } = process.env;
 
 const db = new Firestore();
+const tasksClient = new CloudTasksClient();
+
 const COL_TXN = "txn_invites";
 const COL_INV = "invite_lookup";
+
+const SAFE_RPS_SLEEP_MS = 220;
+const MAX_RETRY = 10;
 
 const trace = (tag, msg, data = null) => {
   console.log(
@@ -30,24 +40,54 @@ const trace = (tag, msg, data = null) => {
   );
 };
 
+/* =========================
+   HELPERS
+   ========================= */
+
+async function enqueueInviteTask(transactionId, delaySeconds = 0) {
+  const parent = tasksClient.queuePath(
+    GCP_PROJECT,
+    GCP_LOCATION,
+    TASKS_QUEUE
+  );
+
+  const task = {
+    httpRequest: {
+      httpMethod: "POST",
+      url: `${BASE_URL}/create-invite-worker`,
+      headers: { "Content-Type": "application/json" },
+      body: Buffer.from(JSON.stringify({ transactionId })).toString("base64"),
+    },
+  };
+
+  if (delaySeconds > 0) {
+    task.scheduleTime = {
+      seconds: Math.floor(Date.now() / 1000) + delaySeconds,
+    };
+  }
+
+  await tasksClient.createTask({ parent, task });
+}
+
 async function fireWebEngage(userId, eventName, eventData) {
   trace("WEBENGAGE", "Firing event", { userId, eventName });
 
-  const url = `https://api.webengage.com/v1/accounts/${WEBENGAGE_LICENSE_CODE}/events`;
-
   try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${WEBENGAGE_API_KEY}`,
-      },
-      body: JSON.stringify({
-        userId: String(userId),
-        eventName,
-        eventData,
-      }),
-    });
+    const res = await fetch(
+      `https://api.webengage.com/v1/accounts/${WEBENGAGE_LICENSE_CODE}/events`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${WEBENGAGE_API_KEY}`,
+        },
+        body: JSON.stringify({
+          userId: String(userId),
+          eventName,
+          eventData,
+        }),
+      }
+    );
 
     const body = await res.text();
     trace("WEBENGAGE", `Status ${res.status}`, body);
@@ -76,25 +116,31 @@ async function createTelegramLink(transactionId) {
   );
 
   const data = await res.json();
-  if (!data.ok) {
-    trace("TELEGRAM", "Invite creation failed", data);
-    throw new Error(data.description);
+
+  if (!res.ok || !data.ok) {
+    throw new Error(
+      data?.description ||
+        `Telegram error status ${res.status}`
+    );
   }
 
-  trace("TELEGRAM", "Invite created");
   return data.result.invite_link;
 }
+
+/* =========================
+   HEALTH
+   ========================= */
 
 app.get("/healthz", (_, res) => res.send("ok"));
 
 /* =========================
-   CREATE INVITE
+   CREATE INVITE (Queue)
    ========================= */
+
 app.post("/create-invite", async (req, res) => {
   trace("API", "create-invite called", req.body);
 
   const apiKey = req.header("x-api-key");
-
   if (apiKey !== STORE_API_KEY) {
     trace("AUTH", "Invalid API key");
     return res.sendStatus(401);
@@ -102,64 +148,125 @@ app.post("/create-invite", async (req, res) => {
 
   const { userId, telegramUserId } = req.body;
 
-  // AUTO-GENERATE transactionId if missing or empty
   const transactionId =
     req.body.transactionId && req.body.transactionId.trim() !== ""
       ? req.body.transactionId
       : `txn_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
 
   if (!userId) {
-    trace("API", "Missing userId");
     return res.sendStatus(400);
   }
 
   try {
-    const inviteLink = await createTelegramLink(transactionId);
+    await db.collection(COL_TXN).doc(transactionId).set({
+      userId,
+      telegramUserId: telegramUserId || null,
+      transactionId,
+      joined: false,
+      status: "QUEUED",
+      attempts: 0,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+
+    await enqueueInviteTask(transactionId);
+
+    res.json({ ok: true, status: "queued" });
+  } catch (err) {
+    trace("ERROR", "Queue failed", err.message);
+    res.status(500).json({ ok: false });
+  }
+});
+
+/* =========================
+   WORKER (Cloud Tasks)
+   ========================= */
+
+app.post("/create-invite-worker", async (req, res) => {
+  try {
+    const { transactionId } = req.body;
+    if (!transactionId) return res.send("ok");
+
+    const txnRef = db.collection(COL_TXN).doc(transactionId);
+    const txnSnap = await txnRef.get();
+    if (!txnSnap.exists) return res.send("ok");
+
+    const txnData = txnSnap.data();
+
+    if (txnData.status === "DONE") return res.send("ok");
+
+    const attempts = (txnData.attempts || 0) + 1;
+
+    if (attempts > MAX_RETRY) {
+      await txnRef.update({
+        status: "FAILED",
+        lastError: "Max retry exceeded",
+      });
+      return res.send("failed");
+    }
+
+    await txnRef.update({
+      status: "PROCESSING",
+      attempts,
+    });
+
+    // Safety throttle
+    await new Promise((r) => setTimeout(r, SAFE_RPS_SLEEP_MS));
+
+    let inviteLink;
+
+    try {
+      inviteLink = await createTelegramLink(transactionId);
+    } catch (err) {
+      trace("WORKER", "Telegram error", err.message);
+
+      const delay = Math.min(3600, 5 * Math.pow(2, attempts));
+
+      await txnRef.update({
+        status: "QUEUED",
+        lastError: err.message,
+      });
+
+      await enqueueInviteTask(transactionId, delay);
+      return res.send("retry_scheduled");
+    }
 
     const inviteHash = crypto
       .createHash("sha256")
       .update(inviteLink)
       .digest("hex");
 
-    const batch = db.batch();
-
-    batch.set(db.collection(COL_TXN).doc(transactionId), {
-      userId,
-      telegramUserId: telegramUserId || null,
+    await db.collection(COL_INV).doc(inviteHash).set({
+      userId: txnData.userId,
+      telegramUserId: txnData.telegramUserId || null,
       transactionId,
+      inviteLink,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+
+    await txnRef.update({
       inviteHash,
       inviteLink,
-      joined: false,
-      createdAt: FieldValue.serverTimestamp(),
+      status: "DONE",
+      updatedAt: FieldValue.serverTimestamp(),
     });
-
-    batch.set(db.collection(COL_INV).doc(inviteHash), {
-      userId,
-      telegramUserId: telegramUserId || null,
-      transactionId,
-      inviteLink,
-      createdAt: FieldValue.serverTimestamp(),
-    });
-
-    await batch.commit();
-    trace("DB", "Invite stored", { transactionId });
 
     await fireWebEngage(
-      userId,
+      txnData.userId,
       "pass_paid_community_telegram_link_created",
       { transactionId, inviteLink }
     );
 
-    res.json({ ok: true, inviteLink });
+    res.send("ok");
   } catch (err) {
-    trace("ERROR", "create-invite failed", err.message);
-    res.status(500).json({ ok: false });
+    trace("WORKER", "Fatal error", err.message);
+    res.send("ok");
   }
 });
 
 /* =========================
-   TELEGRAM WEBHOOK
+   TELEGRAM WEBHOOK (JOIN)
    ========================= */
+
 app.post("/telegram-webhook", async (req, res) => {
   trace("WEBHOOK", "Received Telegram webhook");
 
@@ -232,6 +339,8 @@ app.post("/telegram-webhook", async (req, res) => {
 
   res.send("ok");
 });
+
+/* ========================= */
 
 app.listen(PORT, "0.0.0.0", () =>
   trace("SYSTEM", `Listening on ${PORT}`)
