@@ -8,8 +8,9 @@ const { CloudTasksClient } = require("@google-cloud/tasks");
 const fetch = (...args) =>
   import("node-fetch").then(({ default: fetch }) => fetch(...args));
 
-const app = express();
-app.use(express.json({ limit: "1mb" }));
+/* =========================
+   ENV CONFIG
+   ========================= */
 
 const {
   TELEGRAM_BOT_TOKEN,
@@ -25,6 +26,13 @@ const {
   PORT = 8080,
 } = process.env;
 
+/* =========================
+   INIT
+   ========================= */
+
+const app = express();
+app.use(express.json({ limit: "1mb" }));
+
 const db = new Firestore();
 const tasksClient = new CloudTasksClient();
 
@@ -33,6 +41,10 @@ const COL_INV = "invite_lookup";
 
 const SAFE_RPS_SLEEP_MS = 220;
 const MAX_RETRY = 10;
+
+/* =========================
+   LOGGING
+   ========================= */
 
 const trace = (tag, msg, data = null) => {
   console.log(
@@ -45,6 +57,10 @@ const trace = (tag, msg, data = null) => {
    ========================= */
 
 async function enqueueInviteTask(transactionId, delaySeconds = 0) {
+  if (!GCP_PROJECT || !BASE_URL) {
+    throw new Error("Missing GCP_PROJECT or BASE_URL");
+  }
+
   const parent = tasksClient.queuePath(
     GCP_PROJECT,
     GCP_LOCATION,
@@ -56,7 +72,9 @@ async function enqueueInviteTask(transactionId, delaySeconds = 0) {
       httpMethod: "POST",
       url: `${BASE_URL}/create-invite-worker`,
       headers: { "Content-Type": "application/json" },
-      body: Buffer.from(JSON.stringify({ transactionId })).toString("base64"),
+      body: Buffer.from(
+        JSON.stringify({ transactionId })
+      ).toString("base64"),
     },
   };
 
@@ -124,17 +142,18 @@ async function createTelegramLink(transactionId) {
     );
   }
 
+  trace("TELEGRAM", "Invite created");
   return data.result.invite_link;
 }
 
 /* =========================
-   HEALTH
+   HEALTH CHECK
    ========================= */
 
 app.get("/healthz", (_, res) => res.send("ok"));
 
 /* =========================
-   CREATE INVITE (Queue)
+   CREATE INVITE (Queued)
    ========================= */
 
 app.post("/create-invite", async (req, res) => {
@@ -153,9 +172,7 @@ app.post("/create-invite", async (req, res) => {
       ? req.body.transactionId
       : `txn_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
 
-  if (!userId) {
-    return res.sendStatus(400);
-  }
+  if (!userId) return res.sendStatus(400);
 
   try {
     await db.collection(COL_TXN).doc(transactionId).set({
@@ -178,7 +195,7 @@ app.post("/create-invite", async (req, res) => {
 });
 
 /* =========================
-   WORKER (Cloud Tasks)
+   WORKER
    ========================= */
 
 app.post("/create-invite-worker", async (req, res) => {
@@ -191,7 +208,6 @@ app.post("/create-invite-worker", async (req, res) => {
     if (!txnSnap.exists) return res.send("ok");
 
     const txnData = txnSnap.data();
-
     if (txnData.status === "DONE") return res.send("ok");
 
     const attempts = (txnData.attempts || 0) + 1;
@@ -199,7 +215,7 @@ app.post("/create-invite-worker", async (req, res) => {
     if (attempts > MAX_RETRY) {
       await txnRef.update({
         status: "FAILED",
-        lastError: "Max retry exceeded",
+        lastError: "Max retries exceeded",
       });
       return res.send("failed");
     }
@@ -209,7 +225,6 @@ app.post("/create-invite-worker", async (req, res) => {
       attempts,
     });
 
-    // Safety throttle
     await new Promise((r) => setTimeout(r, SAFE_RPS_SLEEP_MS));
 
     let inviteLink;
@@ -258,21 +273,19 @@ app.post("/create-invite-worker", async (req, res) => {
 
     res.send("ok");
   } catch (err) {
-    trace("WORKER", "Fatal error", err.message);
+    trace("WORKER", "Fatal", err.message);
     res.send("ok");
   }
 });
 
 /* =========================
-   TELEGRAM WEBHOOK (JOIN)
+   TELEGRAM WEBHOOK
    ========================= */
 
 app.post("/telegram-webhook", async (req, res) => {
   trace("WEBHOOK", "Received Telegram webhook");
 
-  if (FIRE_JOIN_EVENT !== "true") {
-    return res.send("ignored");
-  }
+  if (FIRE_JOIN_EVENT !== "true") return res.send("ignored");
 
   const cm = req.body.chat_member || req.body.my_chat_member;
   if (!cm) return res.send("ignored");
@@ -289,10 +302,13 @@ app.post("/telegram-webhook", async (req, res) => {
     return res.send("ignored");
   }
 
-  const inviteHash = crypto.createHash("sha256").update(inviteLink).digest("hex");
+  const inviteHash = crypto
+    .createHash("sha256")
+    .update(inviteLink)
+    .digest("hex");
+
   const inviteRef = db.collection(COL_INV).doc(inviteHash);
   const inviteSnap = await inviteRef.get();
-
   if (!inviteSnap.exists) return res.send("not_found");
 
   const { transactionId, userId } = inviteSnap.data();
@@ -306,6 +322,7 @@ app.post("/telegram-webhook", async (req, res) => {
     if (!txnSnap.exists) return;
 
     const txnData = txnSnap.data();
+
     if (!txnData.joined) {
       finalTelegramUserId =
         txnData.telegramUserId || joinedTelegramUserId;
@@ -342,6 +359,6 @@ app.post("/telegram-webhook", async (req, res) => {
 
 /* ========================= */
 
-app.listen(PORT, "0.0.0.0", () =>
-  trace("SYSTEM", `Listening on ${PORT}`)
-);
+app.listen(PORT, "0.0.0.0", () => {
+  trace("SYSTEM", `Listening on ${PORT}`);
+});
